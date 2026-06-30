@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Lead Vetter</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="popup">
+
+    <div class="header">
+      <div class="header-title">
+        <div class="logo">LV</div>
+        <span>Lead Vetter</span>
+      </div>
+    </div>
+
+    <!-- Main Menu -->
+    <div id="mainMenu">
+      <div class="menu-item" id="createWorkflowBtn">
+        <div class="menu-item-left">
+          <span class="menu-icon">+</span>
+          <span>Create Workflow</span>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="menu-item has-submenu" id="runWorkflowBtn">
+        <div class="menu-item-left">
+          <span class="menu-icon">&#9654;</span>
+          <span>Run Workflow</span>
+        </div>
+        <span class="arrow" id="runWorkflowArrow">&#8250;</span>
+      </div>
+
+      <div class="submenu" id="workflowSubmenu">
+        <div class="submenu-empty" id="noWorkflows">No workflows saved</div>
+      </div>
+    </div>
+
+    <!-- Create Workflow Panel -->
+    <div class="panel" id="createPanel" style="display:none">
+      <div class="panel-header">
+        <button class="back-btn" id="backFromCreate">&#8249; Back</button>
+        <h2>Create Workflow</h2>
+      </div>
+      <div class="form">
+        <label for="workflowName">Workflow Name</label>
+        <input type="text" id="workflowName" placeholder="e.g. Filter Paralegals" />
+        <label for="workflowCriteria">Criteria</label>
+        <textarea id="workflowCriteria" placeholder="Describe what a matching lead looks like..."></textarea>
+        <button class="btn-primary" id="saveWorkflowBtn">Save Workflow</button>
+      </div>
+    </div>
+
+    <!-- Status Panel -->
+    <div class="panel" id="statusPanel" style="display:none">
+      <div class="panel-header">
+        <h2 id="statusTitle">Running Workflow</h2>
+      </div>
+      <div class="status">
+        <div class="status-message" id="statusMessage">Initializing...</div>
+        <div class="progress-track">
+          <div class="progress-fill" id="progressFill"></div>
+        </div>
+        <div class="status-sub" id="statusSub"></div>
+      </div>
+      <button class="btn-danger" id="stopBtn">Stop</button>
+    </div>
+
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>
