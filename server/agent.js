@@ -31,7 +31,7 @@ Criteria (ALL must be met to pass):
 1. The current job title must semantically match the target title (allow variations like "Legal Assistant", "Litigation Paralegal", "Attorney at Law", etc.)
 2. If company HTML is provided: the company employee count must be exactly "2-10 employees"
 3. Activity: if no activity HTML is provided, recentActivity is false and the lead fails. 
-  If activity HTML is provided, any engagement counts — original posts, reposts, comments, 
+  If activity HTML is provided, any engagement counts — original posts, reposts, comments, commented, 
   and likes or any interaction found in this section all qualify. Find the timestamp (values like "3w", "2d", "1mo", "4w").
   Rule: Xh, Xd, or Xw where X is 1–4 → recentActivity=true (PASS). "1mo" or any higher value → recentActivity=false (FAIL). 
   "4w" explicitly PASSES — do not treat it as equivalent to 1 month.
