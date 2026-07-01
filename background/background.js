@@ -55,6 +55,8 @@ async function runWorkflow(workflow, heyreachTabId) {
     state.totalUrls = urls.length;
     broadcast({ step: 'processing', message: `Found ${urls.length} leads. Starting checks...`, current: 0, total: urls.length });
 
+    let nextTabPromise = null; // pre-opened next tab — resolves during LLM inference
+
     for (let i = 0; i < urls.length; i++) {
       if (state.stopped) break;
 
@@ -63,7 +65,14 @@ async function runWorkflow(workflow, heyreachTabId) {
 
       broadcast({ step: 'checking', message: `Checking lead ${i + 1} of ${urls.length}`, current: i + 1, total: urls.length });
 
-      const linkedInTabId = await openTabAndWait(url, true);
+      let linkedInTabId;
+      if (nextTabPromise !== null) {
+        try { linkedInTabId = await nextTabPromise; } catch (_) { linkedInTabId = null; }
+        nextTabPromise = null;
+        if (!linkedInTabId) linkedInTabId = await openTabAndWait(url, true);
+      } else {
+        linkedInTabId = await openTabAndWait(url, true);
+      }
       await waitForLinkedInContent(linkedInTabId);
 
       // Scroll down in steps from the background script — each step scrolls the
@@ -250,6 +259,12 @@ async function runWorkflow(workflow, heyreachTabId) {
 
       await chrome.tabs.remove(linkedInTabId);
 
+      // Pre-open the next tab in the background while the LLM processes this lead.
+      // Tab HTML/JS loads during inference (~4s), eliminating the inter-lead gap.
+      if (i + 1 < urls.length && !state.stopped) {
+        nextTabPromise = openTabAndWait(urls[i + 1], false);
+      }
+
       // ── Send both HTMLs to the server in one request ────────────────────────
       const checkRes = await fetch(`${MOCK_SERVER}/check-lead`, {
         method: 'POST',
@@ -272,6 +287,12 @@ async function runWorkflow(workflow, heyreachTabId) {
         //   broadcast({ step: 'error', message: `Remove failed: ${result.error}` });
         // }
       }
+    }
+
+    // Close any pre-opened tab that was never consumed (workflow stopped early)
+    if (nextTabPromise) {
+      nextTabPromise.then(id => chrome.tabs.remove(id).catch(() => {})).catch(() => {});
+      nextTabPromise = null;
     }
 
     state.running = false;
