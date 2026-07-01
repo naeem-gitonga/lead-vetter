@@ -5,6 +5,8 @@
   "description": "Automate lead vetting workflows on heyreach.io",
   "permissions": [
     "activeTab",
+    "cookies",
+    "downloads",
     "scripting",
     "storage",
     "tabs"

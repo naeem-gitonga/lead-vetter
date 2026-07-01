@@ -39,26 +39,18 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 async function runWorkflow(workflow, heyreachTabId) {
   state = { running: true, stopped: false, workflow, currentIndex: 0, totalUrls: 0 };
+  let heyreachScrolled = false;
 
   try {
     await ensureContentScript(heyreachTabId);
     await sendToContentScript(heyreachTabId, { action: 'showStopButton' });
 
-    broadcast({ step: 'extracting', message: 'Reading leads from page...' });
+    await fetch(`${MOCK_SERVER}/workflow-start`, { method: 'POST' });
 
-    // Grab the full HTML from the active heyreach tab
-    const [{ result: pageHtml }] = await chrome.scripting.executeScript({
-      target: { tabId: heyreachTabId },
-      func: () => document.documentElement.outerHTML,
-    });
+    broadcast({ step: 'extracting', message: 'Exporting leads from heyreach...' });
 
-    // Ask the mock server to extract LinkedIn URLs
-    const extractRes = await fetch(`${MOCK_SERVER}/extract-urls`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ html: pageHtml }),
-    });
-    const { urls } = await extractRes.json();
+    const csvText = await fetchHeyreachCsv(heyreachTabId);
+    const urls = parseLinkedInUrls(csvText);
 
     state.totalUrls = urls.length;
     broadcast({ step: 'processing', message: `Found ${urls.length} leads. Starting checks...`, current: 0, total: urls.length });
@@ -71,49 +63,139 @@ async function runWorkflow(workflow, heyreachTabId) {
 
       broadcast({ step: 'checking', message: `Checking lead ${i + 1} of ${urls.length}`, current: i + 1, total: urls.length });
 
-      // Open the LinkedIn profile tab in the foreground so window.scrollTo
-      // triggers LinkedIn's IntersectionObserver lazy-loading.
       const linkedInTabId = await openTabAndWait(url, true);
       await waitForLinkedInContent(linkedInTabId);
 
-      // Scroll to the bottom then wait 5 s for the Experience section to render.
-      await chrome.scripting.executeScript({
-        target: { tabId: linkedInTabId },
-        func: () => window.scrollTo(0, document.body.scrollHeight),
-      });
-      console.log('[background] Scrolled profile page — waiting 5 s for lazy content...');
-      await sleep(5000);
-
-      // ── Capture LinkedIn Experience section HTML (after lazy content has loaded) ──
+      // Scroll down in steps from the background script — each step scrolls the
+      // page, waits for LinkedIn's IntersectionObserver to fire and render the
+      // newly visible section, then checks if Experience is in the DOM.
+      // ── Scroll and extract Experience ────────────────────────────────────────
+      // Drive the loop from the background script (synchronous executeScript calls
+      // + sleep here) so LinkedIn's JS cannot reset the scroll between our steps.
+      // Activity sits directly above Experience — once Activity's bottom is fully
+      // on screen, we pause and wait for Experience to render beneath it.
       let profileHtml = '';
+      try {
+        await chrome.tabs.update(linkedInTabId, { active: true });
+
+        domEvent('profile_start', { url });
+
+        let scrollY = 0;
+        let activityTriggered = false;
+
+        for (let i = 0; i < 60; i++) {
+          scrollY += 300;
+
+          domEvent('scroll', { y: scrollY });
+
+          await chrome.scripting.executeScript({
+            target: { tabId: linkedInTabId },
+            func: (y) => {
+              const main = document.querySelector('.scaffold-layout__main') ||
+                           document.querySelector('main');
+              if (main) main.scrollTo({ top: y, behavior: 'smooth' });
+            },
+            args: [scrollY],
+          });
+
+          await sleep(1000);
+
+          const [{ result: state }] = await chrome.scripting.executeScript({
+            target: { tabId: linkedInTabId },
+            func: () => {
+              const experience =
+                document.querySelector('[componentkey$="ExperienceTopLevelSection"]') ||
+                document.querySelector('section[aria-label="Experience"]');
+              const activity = document.querySelector('[componentkey$="Activity"]');
+              const activityRect = activity ? activity.getBoundingClientRect() : null;
+              const main = document.querySelector('.scaffold-layout__main') ||
+                           document.querySelector('main');
+              return {
+                text: experience ? experience.innerText.trim() : '',
+                activityBottomVisible: activityRect
+                  ? activityRect.bottom > 0 && activityRect.bottom <= window.innerHeight
+                  : false,
+                atBottom: main
+                  ? main.scrollTop + main.clientHeight >= main.scrollHeight - 50
+                  : window.scrollY + window.innerHeight >= document.body.scrollHeight - 50,
+              };
+            },
+          });
+
+          domEvent('dom_check', {
+            exp: state.text ? `yes(${state.text.length}c)` : 'no',
+            actBottom: state.activityBottomVisible ? 'yes' : 'no',
+            atBottom: state.atBottom ? 'yes' : 'no',
+          });
+
+          if (state.text) {
+            domEvent('experience_found', { chars: state.text.length });
+            profileHtml = state.text;
+            break;
+          }
+
+          if (state.atBottom) {
+            domEvent('reached_bottom');
+            break;
+          }
+
+          if (!activityTriggered && state.activityBottomVisible) {
+            activityTriggered = true;
+            domEvent('activity_visible_waiting');
+            await sleep(1000);
+            const [{ result: text }] = await chrome.scripting.executeScript({
+              target: { tabId: linkedInTabId },
+              func: () => {
+                const el =
+                  document.querySelector('[componentkey$="ExperienceTopLevelSection"]') ||
+                  document.querySelector('section[aria-label="Experience"]');
+                return el ? el.innerText.trim() : '';
+              },
+            });
+            if (text) {
+              domEvent('experience_found_after_activity', { chars: text.length });
+              profileHtml = text;
+              break;
+            }
+          }
+        }
+      } catch (err) {
+        console.warn(`[background] Scroll-and-extract failed for ${url}:`, err.message);
+      }
+
+      // If the Experience section never appeared, flag for investigation — don't auto-delete
+      if (!profileHtml) {
+        console.warn(`[background] Could not load profile for ${url} — marking for investigation`);
+        await fetch(`${MOCK_SERVER}/mark-investigation`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, reason: 'Experience section not found after retry' }),
+        });
+        broadcast({ step: 'checking', message: `Flagged lead ${i + 1} of ${urls.length} for investigation`, current: i + 1, total: urls.length });
+        await chrome.tabs.remove(linkedInTabId);
+        continue;
+      }
+
+      console.log(`[background] Experience section text: ${profileHtml.length} chars for ${url}`);
+
+      // ── Capture most recent Activity post ─────────────────────────────────────
+      let activityHtml = '';
       try {
         const [{ result }] = await chrome.scripting.executeScript({
           target: { tabId: linkedInTabId },
           func: () => {
-            // LinkedIn SDUI: componentkey ends with "Experience"
-            const bySdui = document.querySelector('[componentkey$="Experience"]');
-            if (bySdui) {
-              const section = bySdui.closest('section') || bySdui;
-              return section.outerHTML;
-            }
-            // Fallback: section with aria-label="Experience"
-            const byLabel = document.querySelector('section[aria-label="Experience"]');
-            if (byLabel) return byLabel.outerHTML;
-            // Fallback: find <h2> whose text is exactly "Experience"
-            for (const h2 of document.querySelectorAll('h2')) {
-              if (h2.textContent.trim() === 'Experience') {
-                const section = h2.closest('section');
-                if (section) return section.outerHTML;
-              }
-            }
-            return '';
+            const activityEl = document.querySelector('[componentkey$="Activity"]');
+            if (!activityEl) return '';
+            if (activityEl.textContent.includes('no recent posts')) return '';
+            // First carousel child = most recent post; innerText strips all markup
+            const firstPost = activityEl.querySelector('[data-testid="carousel-child-container"]');
+            return firstPost ? firstPost.innerText.trim() : '';
           },
         });
-        profileHtml = cleanHtml(result || '');
-        console.log(`[background] Experience section HTML: ${profileHtml.length} chars for ${url}`);
-        if (!profileHtml) console.warn(`[background] Experience section not found for ${url}`);
+        activityHtml = result || '';
+        console.log(`[background] Activity text: ${activityHtml.length} chars for ${url}`);
       } catch (err) {
-        console.warn(`[background] Could not capture profile HTML for ${url}:`, err.message);
+        console.warn(`[background] Could not capture activity HTML for ${url}:`, err.message);
       }
 
       // ── Find the company URL from the live DOM (Experience is now rendered) ──
@@ -147,12 +229,12 @@ async function runWorkflow(workflow, heyreachTabId) {
                 // Classic LinkedIn company about page wraps description + structured
                 // data (industry, company size, headquarters, etc.) in this section.
                 const section = document.querySelector('section.org-about-module__margin-bottom');
-                if (section) return section.outerHTML;
+                if (section) return section.innerText.trim();
                 return '';
               },
             });
-            companyHtml = cleanHtml(result || '');
-            console.log(`[background] Company about HTML: ${companyHtml.length} chars`);
+            companyHtml = result || '';
+            console.log(`[background] Company about text: ${companyHtml.length} chars`);
             if (!companyHtml) console.warn('[background] Company about section not found');
           } catch (err) {
             console.warn('[background] Could not capture company HTML:', err.message);
@@ -172,27 +254,32 @@ async function runWorkflow(workflow, heyreachTabId) {
       const checkRes = await fetch(`${MOCK_SERVER}/check-lead`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profileHtml, companyHtml, workflow, url }),
+        body: JSON.stringify({ profileHtml, companyHtml, activityHtml, workflow, url }),
       });
       const { pass } = await checkRes.json();
 
       if (!pass) {
-        broadcast({ step: 'removing', message: `Removing lead ${i + 1} of ${urls.length}`, current: i + 1, total: urls.length });
-
-        // Guarantee the content script is present — it won't be on tabs that were
-        // already open when the extension was first loaded.
         await ensureContentScript(heyreachTabId);
-
-        const result = await sendToContentScript(heyreachTabId, { action: 'removeLead', linkedInUrl: url });
-        if (result && !result.ok) {
-          console.warn(`[background] removeLead failed for ${url}:`, result.error);
-          broadcast({ step: 'error', message: `Remove failed: ${result.error}` });
+        if (!heyreachScrolled) {
+          await sendToContentScript(heyreachTabId, { action: 'scrollToLoadAll' });
+          heyreachScrolled = true;
         }
+
+        // REMOVAL COMMENTED OUT
+        // const result = await sendToContentScript(heyreachTabId, { action: 'removeLead', linkedInUrl: url });
+        // if (result && !result.ok) {
+        //   console.warn(`[background] removeLead failed for ${url}:`, result.error);
+        //   broadcast({ step: 'error', message: `Remove failed: ${result.error}` });
+        // }
       }
     }
 
     state.running = false;
     await sendToContentScript(heyreachTabId, { action: 'hideStopButton' });
+
+    await downloadCsvIfNotEmpty('/no-activity-leads.csv', 'no-activity-leads.csv');
+    await downloadCsvIfNotEmpty('/investigation-leads.csv', 'investigation-leads.csv');
+
     broadcast({ step: 'done', message: `Done. Processed ${urls.length} leads.`, current: urls.length, total: urls.length });
 
   } catch (err) {
@@ -201,6 +288,7 @@ async function runWorkflow(workflow, heyreachTabId) {
     broadcast({ step: 'error', message: `Error: ${err.message}` });
   }
 }
+
 
 // Polls the LinkedIn tab until the profile's main content section exists in the DOM,
 // or bails out after a timeout so the workflow never hangs indefinitely.
@@ -297,8 +385,109 @@ function sendToContentScript(tabId, message) {
   });
 }
 
+async function downloadCsvIfNotEmpty(serverPath, filename) {
+  try {
+    const res = await fetch(`${MOCK_SERVER}${serverPath}`);
+    const text = await res.text();
+    const lines = text.split('\n').filter(l => l.trim());
+    if (lines.length <= 1) return;
+
+    // Blob URLs don't work in MV3 service workers — use a data URL instead
+    const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(text);
+    await chrome.downloads.download({ url: dataUrl, filename, saveAs: false });
+    console.log(`[background] Downloaded ${filename} (${lines.length - 1} rows)`);
+  } catch (err) {
+    console.warn(`[background] Could not download ${filename}:`, err.message);
+  }
+}
+
+// Fire-and-forget debug logger — does not block the workflow.
+function domEvent(event, data = {}) {
+  fetch(`${MOCK_SERVER}/dom-event`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ event, ts: Date.now(), ...data }),
+  }).catch(() => {});
+}
+
 function broadcast(data) {
   chrome.runtime.sendMessage({ action: 'workflowProgress', ...data }).catch(() => {
     // Popup is closed — nothing to do
   });
+}
+
+async function fetchHeyreachCsv(heyreachTabId) {
+  const tab = await chrome.tabs.get(heyreachTabId);
+  const pathMatch = new URL(tab.url).pathname.match(/\/my-list\/(\d+)/);
+  if (!pathMatch) throw new Error('Navigate to a heyreach list page first');
+  const listId = pathMatch[1];
+
+  const [{ result }] = await chrome.scripting.executeScript({
+    target: { tabId: heyreachTabId },
+    func: async (listId) => {
+      // Abp.AuthToken is not HttpOnly so document.cookie can read it
+      const token = document.cookie
+        .split(';')
+        .map(c => c.trim())
+        .find(c => c.startsWith('Abp.AuthToken='))
+        ?.slice('Abp.AuthToken='.length);
+
+      if (!token) return { error: 'Auth token not found in cookies' };
+
+      // selectedOrganizationUnits is stored as a JSON-encoded string e.g. "145295"
+      const orgRaw = localStorage.getItem('selectedOrganizationUnits');
+      const orgUnits = orgRaw ? JSON.parse(orgRaw) : null;
+
+      const headers = {
+        'authorization': `Bearer ${token}`,
+        'x-requested-with': 'XMLHttpRequest',
+        'accept': 'application/json, text/plain, */*',
+      };
+      if (orgUnits) headers['x-organization-units'] = String(orgUnits);
+
+      try {
+        const resp = await fetch(
+          `https://api.heyreach.io/api/LinkedInUserList/GetExportedUsersFromList?listId=${listId}`,
+          { headers }
+        );
+        if (!resp.ok) return { error: `Export API returned ${resp.status}` };
+        const csvText = await resp.text();
+        return { csvText };
+      } catch (err) {
+        return { error: `Fetch failed: ${err.message}` };
+      }
+    },
+    args: [listId],
+  });
+
+  if (!result || result.error) throw new Error(result?.error || 'Unknown error fetching heyreach CSV');
+  return result.csvText;
+}
+
+function parseCsvLine(line) {
+  const out = [];
+  let current = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { current += '"'; i++; }
+      else inQuotes = !inQuotes;
+    } else if (ch === ',' && !inQuotes) { out.push(current); current = ''; }
+    else { current += ch; }
+  }
+  out.push(current);
+  return out;
+}
+
+function parseLinkedInUrls(csvText) {
+  const lines = csvText.split('\n').filter(l => l.trim());
+  if (lines.length < 2) return [];
+  const headers = parseCsvLine(lines[0]);
+  const urlIdx = headers.findIndex(h => h.trim() === 'Profile URL');
+  if (urlIdx === -1) return [];
+  return lines.slice(1)
+    .map(line => parseCsvLine(line)[urlIdx]?.trim())
+    .filter(u => u && u.startsWith('https://www.linkedin.com/in/'))
+    .map(u => u.replace(/\/$/, ''));
 }

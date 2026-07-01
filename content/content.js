@@ -6,10 +6,17 @@ window.__leadVetterActive = true;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === 'removeLead') {
-    sendResponse({ ok: true }); // ! bring what's commented back when live.
-    // removeLead(msg.linkedInUrl)
-    //   .then(() => sendResponse({ ok: true }))
-    //   .catch(err => sendResponse({ ok: false, error: err.message }));
+    // sendResponse({ ok: true }); // ! bring what's commented back when live.
+    removeLead(msg.linkedInUrl)
+      .then(() => sendResponse({ ok: true }))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
+    return true;
+  }
+
+  if (msg.action === 'scrollToLoadAll') {
+    scrollToLoadAll()
+      .then(() => sendResponse({ ok: true }))
+      .catch(err => sendResponse({ ok: false, error: err.message }));
     return true;
   }
 
@@ -23,6 +30,42 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
   }
 });
+
+// Scrolls the leads table to the bottom repeatedly until no new rows appear,
+// ensuring all lazy-loaded leads are in the DOM before removal begins.
+async function scrollToLoadAll() {
+  // Walk up from a known lead link to find the first scrollable ancestor
+  function findScrollContainer() {
+    const link = document.querySelector('a[href*="linkedin.com/in/"]');
+    if (!link) return null;
+    let el = link.parentElement;
+    while (el && el !== document.body) {
+      const { overflow, overflowY } = window.getComputedStyle(el);
+      if (/auto|scroll/.test(overflow) || /auto|scroll/.test(overflowY)) return el;
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  const container = findScrollContainer();
+  let prevCount = 0;
+  let stableRounds = 0;
+
+  while (stableRounds < 2) {
+    if (container) container.scrollTop = container.scrollHeight;
+    window.scrollTo(0, document.body.scrollHeight);
+
+    await new Promise(r => setTimeout(r, 1500));
+
+    const count = document.querySelectorAll('a[href*="linkedin.com/in/"]').length;
+    if (count > prevCount) {
+      prevCount = count;
+      stableRounds = 0;
+    } else {
+      stableRounds++;
+    }
+  }
+}
 
 async function removeLead(linkedInUrl) {
   const targetPath = normalizePath(linkedInUrl);

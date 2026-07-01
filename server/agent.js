@@ -14,25 +14,29 @@
 //   IAM role in production (ECS/EC2/Lambda), SSO session locally (aws sso login).
 
 const SYSTEM_PROMPT = `You are a lead vetting assistant for a law firm recruiting tool.
-You receive HTML from a LinkedIn profile's Experience section and optionally a LinkedIn company's About section.
-Extract the requested information and decide if the lead meets the criteria.
+You receive HTML from a LinkedIn profile's Experience section, optionally a company's About section, and optionally the most recent Activity post.
+Extract the requested information and decide if the lead meets ALL criteria.
 
 Respond with a raw JSON object — no markdown, no code fences, no extra text before or after. Example:
-{"currentJobTitle":"Paralegal","employeeCount":"2-10 employees","pass":true,"reason":"Current title matches and firm is small."}
+{"currentJobTitle":"Paralegal","employeeCount":"2-10 employees","recentActivity":true,"pass":true,"reason":"Title matches, small firm, active within the last month."}
 
 Fields:
 - currentJobTitle: string | null  — the person's CURRENT job title (most recent role in Experience)
-- employeeCount: string | null    — the company's employee count range as written (e.g. "2-10 employees"), or null if no company HTML provided
-- pass: boolean                   — true if criteria are met (see below)
+- employeeCount: string | null    — the company's employee count range as written (e.g. "2-10 employees"), or null if no company HTML
+- recentActivity: boolean         — true if an activity post was provided AND its timestamp is within the last month; false if no activity or timestamp is older
+- pass: boolean                   — true only if ALL applicable criteria below are met
 - reason: string                  — one sentence explaining the decision
 
-Criteria:
-1. If company HTML is provided: The current job title must semantically match the target title AND the company employee count must be exactly "2-10 employees"
-2. If company HTML is NOT provided (empty): The current job title must semantically match the target title (paralegal, attorney, or closely related roles like "Legal Assistant", "Litigation Paralegal", "Attorney at Law", etc.)
+Criteria (ALL must be met to pass):
+1. The current job title must semantically match the target title (allow variations like "Legal Assistant", "Litigation Paralegal", "Attorney at Law", etc.)
+2. If company HTML is provided: the company employee count must be exactly "2-10 employees"
+3. Activity: if no activity HTML is provided, recentActivity is false and the lead fails. 
+  If activity HTML is provided, any engagement counts — original posts, reposts, comments, 
+  and likes or any interaction found in this section all qualify. Find the timestamp (values like "3w", "2d", "1mo", "4w").
+  Rule: Xh, Xd, or Xw where X is 1–4 → recentActivity=true (PASS). "1mo" or any higher value → recentActivity=false (FAIL). 
+  "4w" explicitly PASSES — do not treat it as equivalent to 1 month.
 
-The target job title is: "paralegal" (but allow variations like attorney, legal assistant, litigation paralegal, etc.)
-
-If criterion 1 (or 2 for no company) fails, pass must be false.`;
+If ANY criterion fails, pass must be false.`;
 
 function parseResponse(raw) {
   // Strip DeepSeek-style <think>...</think> reasoning blocks
@@ -50,6 +54,7 @@ function parseResponse(raw) {
     pass: !!parsed.pass,
     currentJobTitle: parsed.currentJobTitle ?? null,
     employeeCount: parsed.employeeCount ?? null,
+    recentActivity: !!parsed.recentActivity,
     reason: parsed.reason ?? '',
   };
 }
@@ -104,15 +109,15 @@ async function checkLeadBedrock(userMessage) {
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-async function checkLead(profileHtml, companyHtml, jobTitle) {
-  // If no company HTML, use a simpler prompt that only checks job title
-  const hasCompanyHtml = companyHtml && companyHtml.trim().length > 0;
-  
+async function checkLead(profileHtml, companyHtml, activityHtml, jobTitle) {
+  const hasCompany  = companyHtml  && companyHtml.trim().length  > 0;
+  const hasActivity = activityHtml && activityHtml.trim().length > 0;
+
   const userMessage =
-    `Target job title: "${jobTitle}"\n` +
-    (hasCompanyHtml ? '' : '(No company information provided - only check job title)\n\n') +
+    `Target job title: "${jobTitle}"\n\n` +
     `--- EXPERIENCE SECTION HTML ---\n${profileHtml}\n\n` +
-    (hasCompanyHtml ? `--- COMPANY ABOUT HTML ---\n${companyHtml}` : '');
+    (hasCompany  ? `--- COMPANY ABOUT HTML ---\n${companyHtml}\n\n`    : '') +
+    (hasActivity ? `--- MOST RECENT ACTIVITY POST ---\n${activityHtml}` : '(No activity provided — recentActivity must be false, lead fails)');
 
   const backend = (process.env.LLM_BACKEND || 'local').toLowerCase();
   const raw = backend === 'bedrock'
@@ -121,6 +126,7 @@ async function checkLead(profileHtml, companyHtml, jobTitle) {
 
   console.log(`[agent] raw response (first 300 chars): ${raw.slice(0, 300)}`);
   return parseResponse(raw);
+  // return parseResponse({"currentJobTitle":"Paralegal","employeeCount":"2-10 employees","pass":true,"reason":"Current title matches and firm is small."});
 }
 
 module.exports = { checkLead };
