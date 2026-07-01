@@ -1,2 +1,3 @@
 server/html-files/*
 node_modules/
+**/*.csv
