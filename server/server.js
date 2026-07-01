@@ -6,7 +6,7 @@ const { checkLead } = require('./agent');
 
 const HTML_DIR = path.join(__dirname, 'html-files');
 const REJECTED_URLS_FILE = path.join(__dirname, '/html-files/to-be-deleted.json');
-
+const { WRITE_CONTENTS_TO_FILE } = process.env;
 // Load existing rejected URLs or initialize empty array
 let rejectedUrls = [];
 try {
@@ -98,19 +98,9 @@ app.post('/check-lead', async (req, res) => {
   console.log(`[check-lead] Activity HTML: ${activityHtml.length} chars`);
 
   // Write HTMLs to files for inspection
-  const slug = url.replace(/https?:\/\/(www\.)?linkedin\.com\/in\//, '').replace(/\/$/, '').replace(/[^a-z0-9-]/gi, '-');
-  if (profileHtml) {
-    fs.writeFileSync(path.join(HTML_DIR, `${slug}-profile.html`), profileHtml);
-    console.log(`[check-lead] Wrote profile HTML to ${slug}-profile.html`);
-  }
-  if (companyHtml) {
-    fs.writeFileSync(path.join(HTML_DIR, `${slug}-company.html`), companyHtml);
-    console.log(`[check-lead] Wrote company HTML to ${slug}-company.html`);
-  }
-  if (activityHtml) {
-    fs.writeFileSync(path.join(HTML_DIR, `${slug}-activity.html`), activityHtml);
-    console.log(`[check-lead] Wrote activity HTML to ${slug}-activity.html`);
-  }
+  WRITE_CONTENTS_TO_FILE && [{ filename: 'profile', content: profileHtml, type: 'profile' },
+   { filename: 'company', content: companyHtml, type: 'company' },
+   { filename: 'activity', content: activityHtml, type: 'activity' }].forEach(writeToFile);
 
   try {
     const result = await checkLead(profileHtml, companyHtml, activityHtml, jobTitle);
@@ -150,6 +140,12 @@ app.post('/check-lead', async (req, res) => {
     res.status(500).json({ pass: true, reason: `Agent error: ${err.message}` });
   }
 });
+
+function writeToFile({filename, content, type, url}) {
+  const slug = url.replace(/https?:\/\/(www\.)?linkedin\.com\/in\//, '').replace(/\/$/, '').replace(/[^a-z0-9-]/gi, '-');
+  fs.writeFileSync(path.join(HTML_DIR, `${slug}-${type}.html`), content);
+  console.log(`[check-lead] Wrote ${type} HTML to ${slug}-${type}.html`);
+}
 
 const PORT = 3000;
 app.listen(PORT, () => {
