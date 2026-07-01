@@ -6,7 +6,6 @@ window.__leadVetterActive = true;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === 'removeLead') {
-    // sendResponse({ ok: true }); // ! bring what's commented back when live.
     removeLead(msg.linkedInUrl)
       .then(() => sendResponse({ ok: true }))
       .catch(err => sendResponse({ ok: false, error: err.message }));

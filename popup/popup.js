@@ -1,7 +1,14 @@
 document.addEventListener('DOMContentLoaded', async () => {
   const mainMenu       = document.getElementById('mainMenu');
   const createPanel    = document.getElementById('createPanel');
+  const testPanel      = document.getElementById('testPanel');
   const statusPanel    = document.getElementById('statusPanel');
+
+  const testProfileBtn     = document.getElementById('testProfileBtn');
+  const backFromTest       = document.getElementById('backFromTest');
+  const testUrlInput       = document.getElementById('testUrl');
+  const testCriteriaInput  = document.getElementById('testCriteria');
+  const runTestBtn         = document.getElementById('runTestBtn');
 
   const createWorkflowBtn  = document.getElementById('createWorkflowBtn');
   const runWorkflowBtn     = document.getElementById('runWorkflowBtn');
@@ -49,6 +56,35 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   // ── Menu interactions ────────────────────────────────────────────────────
+
+  testProfileBtn.addEventListener('click', () => {
+    testUrlInput.value = '';
+    testCriteriaInput.value = workflows[0]?.criteria || 'paralegal';
+    testUrlInput.classList.remove('error');
+    showTestPanel();
+  });
+
+  backFromTest.addEventListener('click', showMainMenu);
+
+  runTestBtn.addEventListener('click', () => {
+    const url = testUrlInput.value.trim();
+    if (!url || !url.includes('linkedin.com/in/')) {
+      testUrlInput.classList.add('error');
+      testUrlInput.focus();
+      return;
+    }
+    const criteria = testCriteriaInput.value.trim() || 'paralegal';
+    statusTitle.textContent = 'Testing Profile';
+    statusMessage.textContent = 'Opening profile...';
+    progressFill.style.width = '0%';
+    progressFill.style.background = '#2563eb';
+    statusSub.textContent = url;
+    stopBtn.disabled = true;
+    showStatus();
+    chrome.runtime.sendMessage({ action: 'testProfile', url, criteria });
+  });
+
+  testUrlInput.addEventListener('input', () => testUrlInput.classList.remove('error'));
 
   createWorkflowBtn.addEventListener('click', () => {
     workflowNameInput.value = '';
@@ -148,20 +184,30 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function showMainMenu() {
-    mainMenu.style.display  = 'block';
+    mainMenu.style.display    = 'block';
     createPanel.style.display = 'none';
+    testPanel.style.display   = 'none';
     statusPanel.style.display = 'none';
   }
 
   function showCreatePanel() {
-    mainMenu.style.display  = 'none';
+    mainMenu.style.display    = 'none';
     createPanel.style.display = 'block';
+    testPanel.style.display   = 'none';
+    statusPanel.style.display = 'none';
+  }
+
+  function showTestPanel() {
+    mainMenu.style.display    = 'none';
+    createPanel.style.display = 'none';
+    testPanel.style.display   = 'block';
     statusPanel.style.display = 'none';
   }
 
   function showStatus() {
-    mainMenu.style.display  = 'none';
+    mainMenu.style.display    = 'none';
     createPanel.style.display = 'none';
+    testPanel.style.display   = 'none';
     statusPanel.style.display = 'block';
   }
 

@@ -13,6 +13,8 @@
 //   Credentials for Bedrock are resolved via the default AWS credential chain:
 //   IAM role in production (ECS/EC2/Lambda), SSO session locally (aws sso login).
 
+const logger = require('./logger');
+
 const SYSTEM_PROMPT = `You are a lead vetting assistant for a law firm recruiting tool.
 You receive HTML from a LinkedIn profile's Experience section, optionally a company's About section, and optionally the most recent Activity post.
 Extract the requested information and decide if the lead meets ALL criteria.
@@ -30,11 +32,13 @@ Fields:
 Criteria (ALL must be met to pass):
 1. The current job title must semantically match the target title (allow variations like "Legal Assistant", "Litigation Paralegal", "Attorney at Law", etc.)
 2. If company HTML is provided: the company employee count must be exactly "2-10 employees"
-3. Activity: if no activity HTML is provided, recentActivity is false and the lead fails. 
-  If activity HTML is provided, any engagement counts — original posts, reposts, comments, commented, 
-  and likes or any interaction found in this section all qualify. Find the timestamp (values like "3w", "2d", "1mo", "4w").
-  Rule: Xh, Xd, or Xw where X is 1–4 → recentActivity=true (PASS). "1mo" or any higher value → recentActivity=false (FAIL). 
-  "4w" explicitly PASSES — do not treat it as equivalent to 1 month.
+3. Activity: if no activity HTML is provided, recentActivity is false and the lead fails.
+  If activity HTML is provided, the section may list multiple activities. You must find ONLY the FIRST
+  (most recent) timestamp and evaluate that one alone. Ignore all subsequent timestamps.
+  Any engagement type qualifies: original posts, reposts, comments, likes.
+  Timestamps look like "3w", "2d", "1mo", "4w". Find the first one that appears in the text.
+  Rule: Xh, Xd, or Xw where X is 1–4 → recentActivity=true (PASS). "1mo" or higher → recentActivity=false (FAIL).
+  "4w" explicitly PASSES — it is 4 weeks, not 1 month.
 
 If ANY criterion fails, pass must be false.`;
 
@@ -66,7 +70,7 @@ async function checkLeadLocal(userMessage) {
   const baseURL = process.env.LOCAL_MODEL_URL || 'http://192.168.2.17:8884/v1';
   const model   = process.env.LOCAL_MODEL_NAME || 'local';
 
-  console.log(`[agent] backend=local  url=${baseURL}  model=${model}`);
+  logger.debug('agent', `backend=local  url=${baseURL}  model=${model}`);
 
   const client = new OpenAI({ baseURL, apiKey: 'local' });
   const response = await client.chat.completions.create({
@@ -90,7 +94,7 @@ async function checkLeadBedrock(userMessage) {
   const region  = process.env.AWS_REGION       || 'us-east-1';
   const modelId = process.env.BEDROCK_MODEL_ID || 'amazon.nova-lite-v1:0';
 
-  console.log(`[agent] backend=bedrock  region=${region}  modelId=${modelId}`);
+  logger.debug('agent', `backend=bedrock  region=${region}  modelId=${modelId}`);
 
   // Credentials come from the default chain: IAM role in prod,
   // SSO session / default profile locally (aws sso login).
@@ -124,7 +128,7 @@ async function checkLead(profileHtml, companyHtml, activityHtml, jobTitle) {
     ? await checkLeadBedrock(userMessage)
     : await checkLeadLocal(userMessage);
 
-  console.log(`[agent] raw response (first 300 chars): ${raw.slice(0, 300)}`);
+  logger.debug('agent', `raw response (first 300 chars): ${raw.slice(0, 300)}`);
   return parseResponse(raw);
   // return parseResponse({"currentJobTitle":"Paralegal","employeeCount":"2-10 employees","pass":true,"reason":"Current title matches and firm is small."});
 }

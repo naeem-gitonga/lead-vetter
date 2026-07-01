@@ -1,3 +1,13 @@
+const LOG_LEVEL = 'debug'; // 'error' | 'warn' | 'info' | 'debug'
+const _ll = { error: 0, warn: 1, info: 2, debug: 3 };
+const _lc = _ll[LOG_LEVEL] ?? 3;
+const logger = {
+  error: (p, m) => { if (0 <= _lc) console.error(`[${new Date().toISOString().slice(0,19)}] ${p} ${m}`); },
+  warn:  (p, m) => { if (1 <= _lc) console.warn( `[${new Date().toISOString().slice(0,19)}] ${p} ${m}`); },
+  info:  (p, m) => { if (2 <= _lc) console.log(  `[${new Date().toISOString().slice(0,19)}] ${p} ${m}`); },
+  debug: (p, m) => { if (3 <= _lc) console.log(  `[${new Date().toISOString().slice(0,19)}] ${p} ${m}`); },
+};
+
 const MOCK_SERVER = 'http://localhost:3000';
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -27,6 +37,9 @@ let state = {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.action === 'runWorkflow') {
     runWorkflow(msg.workflow, msg.tabId);
+    sendResponse({ ok: true });
+  } else if (msg.action === 'testProfile') {
+    testProfile(msg.url, msg.criteria);
     sendResponse({ ok: true });
   } else if (msg.action === 'stopWorkflow') {
     state.stopped = true;
@@ -109,7 +122,7 @@ async function runWorkflow(workflow, heyreachTabId) {
             args: [scrollY],
           });
 
-          await sleep(1000);
+          await sleep(1500);
 
           const [{ result: state }] = await chrome.scripting.executeScript({
             target: { tabId: linkedInTabId },
@@ -171,12 +184,12 @@ async function runWorkflow(workflow, heyreachTabId) {
           }
         }
       } catch (err) {
-        console.warn(`[background] Scroll-and-extract failed for ${url}:`, err.message);
+        logger.warn('background', `Scroll-and-extract failed for ${url}: ${err.message}`);
       }
 
       // If the Experience section never appeared, flag for investigation — don't auto-delete
       if (!profileHtml) {
-        console.warn(`[background] Could not load profile for ${url} — marking for investigation`);
+        logger.warn('background', `Could not load profile for ${url} — marking for investigation`);
         await fetch(`${MOCK_SERVER}/mark-investigation`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -187,7 +200,7 @@ async function runWorkflow(workflow, heyreachTabId) {
         continue;
       }
 
-      console.log(`[background] Experience section text: ${profileHtml.length} chars for ${url}`);
+      logger.debug('background', `Experience section text: ${profileHtml.length} chars for ${url}`);
 
       // ── Start loading the company About tab immediately in the background ──────
       // Kick this off before activity extraction so the tab loads while we're
@@ -205,15 +218,15 @@ async function runWorkflow(workflow, heyreachTabId) {
             return null;
           },
         });
-        console.log(`[background] Company URL from DOM: ${companyUrl}`);
+        logger.debug('background', `Company URL from DOM: ${companyUrl}`);
         if (companyUrl) {
           const aboutUrl = companyUrl.replace(/\/$/, '') + '/about/';
           companyTabPromise = openTabAndWait(aboutUrl, false);
         } else {
-          console.log('[background] No company URL found in profile — skipping company check');
+          logger.debug('background', 'No company URL found in profile — skipping company check');
         }
       } catch (err) {
-        console.warn(`[background] Company URL extraction failed for ${url}:`, err.message);
+        logger.warn('background', `Company URL extraction failed for ${url}: ${err.message}`);
       }
 
       // ── Capture most recent Activity post ─────────────────────────────────────
@@ -234,9 +247,9 @@ async function runWorkflow(workflow, heyreachTabId) {
         });
         activityHtml = result?.text || '';
         domEvent('activity_extract', { chars: activityHtml.length, reason: result?.reason || 'error' });
-        console.log(`[background] Activity text: ${activityHtml.length} chars for ${url}`);
+        logger.debug('background', `Activity text: ${activityHtml.length} chars for ${url}`);
       } catch (err) {
-        console.warn(`[background] Could not capture activity HTML for ${url}:`, err.message);
+        logger.warn('background', `Could not capture activity HTML for ${url}: ${err.message}`);
       }
 
       await chrome.tabs.remove(linkedInTabId);
@@ -256,14 +269,14 @@ async function runWorkflow(workflow, heyreachTabId) {
               },
             });
             companyHtml = result || '';
-            console.log(`[background] Company about text: ${companyHtml.length} chars`);
-            if (!companyHtml) console.warn('[background] Company about section not found');
+            logger.debug('background', `Company about text: ${companyHtml.length} chars`);
+            if (!companyHtml) logger.warn('background', 'Company about section not found');
           } catch (err) {
-            console.warn('[background] Could not capture company HTML:', err.message);
+            logger.warn('background', `Could not capture company HTML: ${err.message}`);
           }
           await chrome.tabs.remove(companyTabId);
         } catch (err) {
-          console.warn(`[background] Company tab failed for ${url}:`, err.message);
+          logger.warn('background', `Company tab failed for ${url}: ${err.message}`);
         }
       }
 
@@ -288,12 +301,11 @@ async function runWorkflow(workflow, heyreachTabId) {
           heyreachScrolled = true;
         }
 
-        // REMOVAL COMMENTED OUT
-        // const result = await sendToContentScript(heyreachTabId, { action: 'removeLead', linkedInUrl: url });
-        // if (result && !result.ok) {
-        //   console.warn(`[background] removeLead failed for ${url}:`, result.error);
-        //   broadcast({ step: 'error', message: `Remove failed: ${result.error}` });
-        // }
+        const result = await sendToContentScript(heyreachTabId, { action: 'removeLead', linkedInUrl: url });
+        if (result && !result.ok) {
+          logger.warn('background', `removeLead failed for ${url}: ${result.error}`);
+          broadcast({ step: 'error', message: `Remove failed: ${result.error}` });
+        }
       }
     }
 
@@ -318,6 +330,165 @@ async function runWorkflow(workflow, heyreachTabId) {
   }
 }
 
+async function testProfile(url, criteria) {
+  if (state.running) return;
+  state = { running: true, stopped: false, workflow: { criteria }, currentIndex: 0, totalUrls: 1 };
+
+  let linkedInTabId = null;
+  try {
+    broadcast({ step: 'processing', message: 'Opening profile...', current: 0, total: 1 });
+
+    linkedInTabId = await openTabAndWait(url, true);
+    await waitForLinkedInContent(linkedInTabId);
+    await ensureContentScript(linkedInTabId);
+    await sendToContentScript(linkedInTabId, { action: 'showStopButton' });
+
+    let profileHtml = '';
+    try {
+      await chrome.tabs.update(linkedInTabId, { active: true });
+      domEvent('profile_start', { url });
+      let scrollY = 0;
+      let activityTriggered = false;
+
+      for (let i = 0; i < 60; i++) {
+        scrollY += 300;
+        domEvent('scroll', { y: scrollY });
+        await chrome.scripting.executeScript({
+          target: { tabId: linkedInTabId },
+          func: (y) => {
+            const main = document.querySelector('.scaffold-layout__main') || document.querySelector('main');
+            if (main) main.scrollTo({ top: y, behavior: 'smooth' });
+          },
+          args: [scrollY],
+        });
+        await sleep(1000);
+
+        const [{ result: domState }] = await chrome.scripting.executeScript({
+          target: { tabId: linkedInTabId },
+          func: () => {
+            const experience =
+              document.querySelector('[componentkey$="ExperienceTopLevelSection"]') ||
+              document.querySelector('section[aria-label="Experience"]');
+            const activity = document.querySelector('[componentkey$="Activity"]');
+            const activityRect = activity ? activity.getBoundingClientRect() : null;
+            const main = document.querySelector('.scaffold-layout__main') || document.querySelector('main');
+            return {
+              text: experience ? experience.innerText.trim() : '',
+              activityBottomVisible: activityRect
+                ? activityRect.bottom > 0 && activityRect.bottom <= window.innerHeight : false,
+              atBottom: main
+                ? main.scrollTop + main.clientHeight >= main.scrollHeight - 50
+                : window.scrollY + window.innerHeight >= document.body.scrollHeight - 50,
+            };
+          },
+        });
+
+        domEvent('dom_check', {
+          exp: domState.text ? `yes(${domState.text.length}c)` : 'no',
+          actBottom: domState.activityBottomVisible ? 'yes' : 'no',
+          atBottom: domState.atBottom ? 'yes' : 'no',
+        });
+
+        if (domState.text) { domEvent('experience_found', { chars: domState.text.length }); profileHtml = domState.text; break; }
+        if (domState.atBottom) { domEvent('reached_bottom'); break; }
+
+        if (!activityTriggered && domState.activityBottomVisible) {
+          activityTriggered = true;
+          domEvent('activity_visible_waiting');
+          await sleep(1000);
+          const [{ result: text }] = await chrome.scripting.executeScript({
+            target: { tabId: linkedInTabId },
+            func: () => {
+              const el = document.querySelector('[componentkey$="ExperienceTopLevelSection"]') ||
+                         document.querySelector('section[aria-label="Experience"]');
+              return el ? el.innerText.trim() : '';
+            },
+          });
+          if (text) { domEvent('experience_found_after_activity', { chars: text.length }); profileHtml = text; break; }
+        }
+      }
+    } catch (err) {
+      console.warn('[testProfile] Scroll failed:', err.message);
+    }
+
+    broadcast({ step: 'processing', message: 'Extracting activity & company...', current: 0, total: 1 });
+
+    let companyHtml = '';
+    let companyTabPromise = null;
+    try {
+      const [{ result: companyUrl }] = await chrome.scripting.executeScript({
+        target: { tabId: linkedInTabId },
+        func: () => {
+          const links = document.querySelectorAll('a[href*="/company/"]');
+          for (const link of links) {
+            if (link.textContent.includes('Present')) return link.href;
+          }
+          return null;
+        },
+      });
+      if (companyUrl) companyTabPromise = openTabAndWait(companyUrl.replace(/\/$/, '') + '/about/', false);
+    } catch (err) {
+      console.warn('[testProfile] Company URL extraction failed:', err.message);
+    }
+
+    let activityHtml = '';
+    try {
+      const [{ result }] = await chrome.scripting.executeScript({
+        target: { tabId: linkedInTabId },
+        func: () => {
+          const activityEl = document.querySelector('[componentkey$="Activity"]');
+          if (!activityEl) return { text: '', reason: 'no_element' };
+          if (activityEl.textContent.includes('no recent posts')) return { text: '', reason: 'no_recent_posts' };
+          const firstPost = activityEl.querySelector('[data-testid="carousel-child-container"]');
+          if (firstPost) return { text: firstPost.innerText.trim(), reason: 'carousel' };
+          return { text: activityEl.innerText.trim(), reason: 'section_fallback' };
+        },
+      });
+      activityHtml = result?.text || '';
+      domEvent('activity_extract', { chars: activityHtml.length, reason: result?.reason || 'error' });
+    } catch (err) {
+      console.warn('[testProfile] Activity extraction failed:', err.message);
+    }
+
+    await chrome.tabs.remove(linkedInTabId);
+    linkedInTabId = null;
+
+    if (companyTabPromise) {
+      try {
+        const companyTabId = await companyTabPromise;
+        await waitForLinkedInContent(companyTabId);
+        const [{ result }] = await chrome.scripting.executeScript({
+          target: { tabId: companyTabId },
+          func: () => {
+            const section = document.querySelector('section.org-about-module__margin-bottom');
+            return section ? section.innerText.trim() : '';
+          },
+        });
+        companyHtml = result || '';
+        await chrome.tabs.remove(companyTabId);
+      } catch (err) {
+        console.warn('[testProfile] Company tab failed:', err.message);
+      }
+    }
+
+    broadcast({ step: 'checking', message: 'Asking agent...', current: 1, total: 1 });
+
+    const checkRes = await fetch(`${MOCK_SERVER}/check-lead`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ profileHtml, companyHtml, activityHtml, workflow: { criteria }, url }),
+    });
+    const { pass, reason } = await checkRes.json();
+
+    state.running = false;
+    broadcast({ step: 'done', message: `${pass ? '✓ PASS' : '✗ FAIL'}: ${reason}`, current: 1, total: 1 });
+
+  } catch (err) {
+    if (linkedInTabId) chrome.tabs.remove(linkedInTabId).catch(() => {});
+    state.running = false;
+    broadcast({ step: 'error', message: `Error: ${err.message}` });
+  }
+}
 
 // Polls the LinkedIn tab until the profile's main content section exists in the DOM,
 // or bails out after a timeout so the workflow never hangs indefinitely.
@@ -338,7 +509,7 @@ async function waitForLinkedInContent(tabId, timeoutMs = 10000) {
       });
 
       if (ready) {
-        console.log(`[background] LinkedIn content ready after ~${(i + 1) * interval}ms`);
+        logger.debug('background', `LinkedIn content ready after ~${(i + 1) * interval}ms`);
         return;
       }
     } catch (_) {
@@ -348,7 +519,7 @@ async function waitForLinkedInContent(tabId, timeoutMs = 10000) {
     await sleep(interval);
   }
 
-  console.warn('[background] LinkedIn content did not appear within timeout — capturing whatever is there');
+  logger.warn('background', 'LinkedIn content did not appear within timeout — capturing whatever is there');
 }
 
 // Opens a tab and resolves with its tabId once fully loaded.
@@ -391,11 +562,11 @@ async function ensureContentScript(tabId) {
     });
 
     if (!active) {
-      console.log('[background] Content script not found — injecting now');
+      logger.debug('background', 'Content script not found — injecting now');
       await chrome.scripting.executeScript({ target: { tabId }, files: ['content/content.js'] });
     }
   } catch (err) {
-    console.warn('[background] ensureContentScript failed:', err.message);
+    logger.warn('background', `ensureContentScript failed: ${err.message}`);
   }
 }
 
@@ -405,7 +576,7 @@ function sendToContentScript(tabId, message) {
   return new Promise((resolve) => {
     chrome.tabs.sendMessage(tabId, message, (response) => {
       if (chrome.runtime.lastError) {
-        console.error('[background] sendToContentScript error:', chrome.runtime.lastError.message);
+        logger.error('background', `sendToContentScript error: ${chrome.runtime.lastError.message}`);
         resolve({ ok: false, error: chrome.runtime.lastError.message });
       } else {
         resolve(response ?? { ok: true });
@@ -424,9 +595,9 @@ async function downloadCsvIfNotEmpty(serverPath, filename) {
     // Blob URLs don't work in MV3 service workers — use a data URL instead
     const dataUrl = 'data:text/csv;charset=utf-8,' + encodeURIComponent(text);
     await chrome.downloads.download({ url: dataUrl, filename, saveAs: false });
-    console.log(`[background] Downloaded ${filename} (${lines.length - 1} rows)`);
+    logger.info('background', `Downloaded ${filename} (${lines.length - 1} rows)`);
   } catch (err) {
-    console.warn(`[background] Could not download ${filename}:`, err.message);
+    logger.warn('background', `Could not download ${filename}: ${err.message}`);
   }
 }
 

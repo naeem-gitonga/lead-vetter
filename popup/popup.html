@@ -26,6 +26,15 @@
 
       <div class="divider"></div>
 
+      <div class="menu-item" id="testProfileBtn">
+        <div class="menu-item-left">
+          <span class="menu-icon">&#9881;</span>
+          <span>Test Profile</span>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
       <div class="menu-item has-submenu" id="runWorkflowBtn">
         <div class="menu-item-left">
           <span class="menu-icon">&#9654;</span>
@@ -36,6 +45,21 @@
 
       <div class="submenu" id="workflowSubmenu">
         <div class="submenu-empty" id="noWorkflows">No workflows saved</div>
+      </div>
+    </div>
+
+    <!-- Test Profile Panel -->
+    <div class="panel" id="testPanel" style="display:none">
+      <div class="panel-header">
+        <button class="back-btn" id="backFromTest">&#8249; Back</button>
+        <h2>Test Profile</h2>
+      </div>
+      <div class="form">
+        <label for="testUrl">LinkedIn URL</label>
+        <input type="text" id="testUrl" placeholder="https://www.linkedin.com/in/..." />
+        <label for="testCriteria">Criteria</label>
+        <input type="text" id="testCriteria" placeholder="paralegal" />
+        <button class="btn-primary" id="runTestBtn">Run Test</button>
       </div>
     </div>
 
