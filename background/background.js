@@ -74,6 +74,8 @@ async function runWorkflow(workflow, heyreachTabId) {
         linkedInTabId = await openTabAndWait(url, true);
       }
       await waitForLinkedInContent(linkedInTabId);
+      await ensureContentScript(linkedInTabId);
+      await sendToContentScript(linkedInTabId, { action: 'showStopButton' });
 
       // Scroll down in steps from the background script — each step scrolls the
       // page, waits for LinkedIn's IntersectionObserver to fire and render the
@@ -187,6 +189,33 @@ async function runWorkflow(workflow, heyreachTabId) {
 
       console.log(`[background] Experience section text: ${profileHtml.length} chars for ${url}`);
 
+      // ── Start loading the company About tab immediately in the background ──────
+      // Kick this off before activity extraction so the tab loads while we're
+      // still on the profile page, overlapping network time with DOM work.
+      let companyHtml = '';
+      let companyTabPromise = null;
+      try {
+        const [{ result: companyUrl }] = await chrome.scripting.executeScript({
+          target: { tabId: linkedInTabId },
+          func: () => {
+            const links = document.querySelectorAll('a[href*="/company/"]');
+            for (const link of links) {
+              if (link.textContent.includes('Present')) return link.href;
+            }
+            return null;
+          },
+        });
+        console.log(`[background] Company URL from DOM: ${companyUrl}`);
+        if (companyUrl) {
+          const aboutUrl = companyUrl.replace(/\/$/, '') + '/about/';
+          companyTabPromise = openTabAndWait(aboutUrl, false);
+        } else {
+          console.log('[background] No company URL found in profile — skipping company check');
+        }
+      } catch (err) {
+        console.warn(`[background] Company URL extraction failed for ${url}:`, err.message);
+      }
+
       // ── Capture most recent Activity post ─────────────────────────────────────
       let activityHtml = '';
       try {
@@ -194,49 +223,33 @@ async function runWorkflow(workflow, heyreachTabId) {
           target: { tabId: linkedInTabId },
           func: () => {
             const activityEl = document.querySelector('[componentkey$="Activity"]');
-            if (!activityEl) return '';
-            if (activityEl.textContent.includes('no recent posts')) return '';
-            // First carousel child = most recent post; innerText strips all markup
+            if (!activityEl) return { text: '', reason: 'no_element' };
+            if (activityEl.textContent.includes('no recent posts')) return { text: '', reason: 'no_recent_posts' };
+            // Carousel container covers posts/reposts; comments/likes don't use it —
+            // fall back to the full section text so the LLM still sees the timestamp.
             const firstPost = activityEl.querySelector('[data-testid="carousel-child-container"]');
-            return firstPost ? firstPost.innerText.trim() : '';
+            if (firstPost) return { text: firstPost.innerText.trim(), reason: 'carousel' };
+            return { text: activityEl.innerText.trim(), reason: 'section_fallback' };
           },
         });
-        activityHtml = result || '';
+        activityHtml = result?.text || '';
+        domEvent('activity_extract', { chars: activityHtml.length, reason: result?.reason || 'error' });
         console.log(`[background] Activity text: ${activityHtml.length} chars for ${url}`);
       } catch (err) {
         console.warn(`[background] Could not capture activity HTML for ${url}:`, err.message);
       }
 
-      // ── Find the company URL from the live DOM (Experience is now rendered) ──
-      let companyHtml = '';
-      try {
-        const [{ result: companyUrl }] = await chrome.scripting.executeScript({
-          target: { tabId: linkedInTabId },
-          func: () => {
-            const links = document.querySelectorAll('a[href*="/company/"]');
-            for (const link of links) {
-              if (link.textContent.includes('Present')) {
-                return link.href;
-              }
-            }
-            return null;
-          },
-        });
-        console.log(`[background] Company URL from DOM: ${companyUrl}`);
+      await chrome.tabs.remove(linkedInTabId);
 
-        if (companyUrl) {
-
-          // Navigate directly to the About page by appending /about/
-          const aboutUrl = companyUrl.replace(/\/$/, '') + '/about/';
-          const companyTabId = await openTabAndWait(aboutUrl);
+      // ── Scrape the company About tab (was loading in background since we found the URL) ──
+      if (companyTabPromise) {
+        try {
+          const companyTabId = await companyTabPromise;
           await waitForLinkedInContent(companyTabId);
-
           try {
             const [{ result }] = await chrome.scripting.executeScript({
               target: { tabId: companyTabId },
               func: () => {
-                // Classic LinkedIn company about page wraps description + structured
-                // data (industry, company size, headquarters, etc.) in this section.
                 const section = document.querySelector('section.org-about-module__margin-bottom');
                 if (section) return section.innerText.trim();
                 return '';
@@ -248,18 +261,13 @@ async function runWorkflow(workflow, heyreachTabId) {
           } catch (err) {
             console.warn('[background] Could not capture company HTML:', err.message);
           }
-
           await chrome.tabs.remove(companyTabId);
-        } else {
-          console.log('[background] No company URL found in profile — skipping company check');
+        } catch (err) {
+          console.warn(`[background] Company tab failed for ${url}:`, err.message);
         }
-      } catch (err) {
-        console.warn(`[background] Company URL extraction failed for ${url}:`, err.message);
       }
 
-      await chrome.tabs.remove(linkedInTabId);
-
-      // Pre-open the next tab in the background while the LLM processes this lead.
+      // Pre-open the next profile tab while the LLM processes this lead.
       // Tab HTML/JS loads during inference (~4s), eliminating the inter-lead gap.
       if (i + 1 < urls.length && !state.stopped) {
         nextTabPromise = openTabAndWait(urls[i + 1], false);

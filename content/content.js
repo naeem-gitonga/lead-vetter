@@ -118,7 +118,7 @@ function showStopButton() {
 
   const btn = document.createElement('button');
   btn.id = '__lv_stop_btn';
-  btn.textContent = '⏹ Stop Workflow';
+  btn.textContent = 'STOP LEAD VETTER';
   btn.style.cssText = [
     'position:fixed',
     'bottom:28px',
@@ -141,7 +141,7 @@ function showStopButton() {
 
   btn.addEventListener('click', () => {
     chrome.runtime.sendMessage({ action: 'stopWorkflow' });
-    btn.textContent = 'Stopping…';
+    btn.textContent = 'STOPPING…';
     btn.disabled = true;
     btn.style.opacity = '0.6';
     btn.style.cursor = 'default';
