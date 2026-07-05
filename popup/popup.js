@@ -178,6 +178,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (step === 'done') {
       progressFill.style.width = '100%';
       progressFill.style.background = '#16a34a';
+    } else if (step === 'paused') {
+      progressFill.style.background = '#d97706'; // amber — cooling down
     } else if (step === 'error') {
       progressFill.style.background = '#dc2626';
     }

@@ -52,7 +52,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
 async function runWorkflow(workflow, heyreachTabId) {
   state = { running: true, stopped: false, workflow, currentIndex: 0, totalUrls: 0 };
-  let heyreachScrolled = false;
+
+  // Chrome MV3 terminates idle service workers after ~30s with no Chrome API activity.
+  // This interval calls chrome.storage every 20s to reset the idle timer for the
+  // entire duration of the workflow, preventing mid-run termination.
+  const keepAlive = setInterval(() => chrome.storage.local.get('__ka'), 20000);
 
   try {
     await ensureContentScript(heyreachTabId);
@@ -62,21 +66,48 @@ async function runWorkflow(workflow, heyreachTabId) {
 
     broadcast({ step: 'extracting', message: 'Exporting leads from heyreach...' });
 
+    // Get the heyreach list ID to key saved progress per-list
+    const heyreachTab = await chrome.tabs.get(heyreachTabId);
+    const listIdMatch = new URL(heyreachTab.url).pathname.match(/\/my-list\/(\d+)/);
+    const listId = listIdMatch?.[1] || 'default';
+    const progressKey = `progress_${listId}`;
+
     const csvText = await fetchHeyreachCsv(heyreachTabId);
-    const urls = parseLinkedInUrls(csvText);
+    const { headers: csvHeaders, leads } = parseLeads(csvText);
 
-    state.totalUrls = urls.length;
-    broadcast({ step: 'processing', message: `Found ${urls.length} leads. Starting checks...`, current: 0, total: urls.length });
+    // Load saved start index for this list (allows resuming after a stop or crash)
+    const savedData = await new Promise(r => chrome.storage.local.get(progressKey, r));
+    const startIndex = savedData[progressKey]?.startIndex || 0;
+    if (startIndex > 0) {
+      logger.info('background', `Resuming from lead ${startIndex + 1} of ${leads.length}`);
+    }
 
-    let nextTabPromise = null; // pre-opened next tab — resolves during LLM inference
+    const SESSION_CAP = 25;
+    state.totalUrls = leads.length;
 
-    for (let i = 0; i < urls.length; i++) {
+    let nextTabPromise = null;
+
+    // Outer loop: batches of SESSION_CAP with a cooldown between each
+    for (let batchStart = startIndex; batchStart < leads.length && !state.stopped; batchStart += SESSION_CAP) {
+      const batch = leads.slice(batchStart, batchStart + SESSION_CAP);
+      const batchNum = Math.floor(batchStart / SESSION_CAP) + 1;
+      const totalBatches = Math.ceil(leads.length / SESSION_CAP);
+
+      broadcast({
+        step: 'processing',
+        message: `Batch ${batchNum} of ${totalBatches} — leads ${batchStart + 1}–${batchStart + batch.length} of ${leads.length}`,
+        current: batchStart,
+        total: leads.length,
+      });
+
+    for (let i = 0; i < batch.length; i++) {
       if (state.stopped) break;
 
-      state.currentIndex = i;
-      const url = urls[i];
+      state.currentIndex = batchStart + i;
+      const { url, row: csvRow } = batch[i];
+      const globalPos = batchStart + i + 1;
 
-      broadcast({ step: 'checking', message: `Checking lead ${i + 1} of ${urls.length}`, current: i + 1, total: urls.length });
+      broadcast({ step: 'checking', message: `Checking lead ${globalPos} of ${leads.length}`, current: globalPos, total: leads.length });
 
       let linkedInTabId;
       if (nextTabPromise !== null) {
@@ -108,7 +139,9 @@ async function runWorkflow(workflow, heyreachTabId) {
         let activityTriggered = false;
 
         for (let i = 0; i < 60; i++) {
-          scrollY += 300;
+          // Vary scroll distance and timing to avoid metronomic bot patterns
+          const scrollStep = 220 + Math.floor(Math.random() * 160); // 220–380px
+          scrollY += scrollStep;
 
           domEvent('scroll', { y: scrollY });
 
@@ -117,12 +150,27 @@ async function runWorkflow(workflow, heyreachTabId) {
             func: (y) => {
               const main = document.querySelector('.scaffold-layout__main') ||
                            document.querySelector('main');
-              if (main) main.scrollTo({ top: y, behavior: 'smooth' });
+              if (!main) return;
+              // Dispatch wheel events before scrolling — populates the event stream
+              // so the sequence (wheel → scroll) mirrors real user input.
+              const cx = 500 + Math.random() * 200;
+              const cy = 300 + Math.random() * 200;
+              for (let tick = 0; tick < 3; tick++) {
+                main.dispatchEvent(new WheelEvent('wheel', {
+                  bubbles: true, cancelable: true,
+                  clientX: cx, clientY: cy,
+                  deltaY: 80 + Math.random() * 40, deltaMode: 0,
+                }));
+              }
+              main.scrollTo({ top: y, behavior: 'smooth' });
             },
             args: [scrollY],
           });
 
-          await sleep(1500);
+          // Random pause: base 1.5–3s, occasionally a longer "reading" pause
+          const base = 1500 + Math.random() * 1500;
+          const extra = Math.random() < 0.2 ? 1000 + Math.random() * 1500 : 0;
+          await sleep(base + extra);
 
           const [{ result: state }] = await chrome.scripting.executeScript({
             target: { tabId: linkedInTabId },
@@ -166,7 +214,7 @@ async function runWorkflow(workflow, heyreachTabId) {
           if (!activityTriggered && state.activityBottomVisible) {
             activityTriggered = true;
             domEvent('activity_visible_waiting');
-            await sleep(1000);
+            await sleep(2000);
             const [{ result: text }] = await chrome.scripting.executeScript({
               target: { tabId: linkedInTabId },
               func: () => {
@@ -195,12 +243,31 @@ async function runWorkflow(workflow, heyreachTabId) {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url, reason: 'Experience section not found after retry' }),
         });
-        broadcast({ step: 'checking', message: `Flagged lead ${i + 1} of ${urls.length} for investigation`, current: i + 1, total: urls.length });
+        broadcast({ step: 'checking', message: `Flagged lead ${i + 1} of ${batch.length} for investigation`, current: i + 1, total: batch.length });
         await chrome.tabs.remove(linkedInTabId);
         continue;
       }
 
       logger.debug('background', `Experience section text: ${profileHtml.length} chars for ${url}`);
+
+      // ── Phase 1: quick title check — skip company/activity if title doesn't match ──
+      broadcast({ step: 'checking', message: `Checking title ${i + 1} of ${batch.length}`, current: i + 1, total: batch.length });
+      try {
+        const titleRes = await fetch(`${MOCK_SERVER}/check-lead`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ profileHtml, workflow, url, titleOnly: true }),
+        });
+        const { pass: titlePass } = await titleRes.json();
+        if (!titlePass) {
+          logger.debug('background', `Title mismatch — skipping ${url}`);
+          domEvent('title_skip', { url });
+          await chrome.tabs.remove(linkedInTabId);
+          continue;
+        }
+      } catch (err) {
+        logger.warn('background', `Title check failed for ${url}: ${err.message} — continuing to full check`);
+      }
 
       // ── Start loading the company About tab immediately in the background ──────
       // Kick this off before activity extraction so the tab loads while we're
@@ -280,54 +347,83 @@ async function runWorkflow(workflow, heyreachTabId) {
         }
       }
 
-      // Pre-open the next profile tab while the LLM processes this lead.
-      // Tab HTML/JS loads during inference (~4s), eliminating the inter-lead gap.
-      if (i + 1 < urls.length && !state.stopped) {
-        nextTabPromise = openTabAndWait(urls[i + 1], false);
+      // Pre-open next lead within the same batch during LLM inference
+      if (i + 1 < batch.length && !state.stopped) {
+        nextTabPromise = openTabAndWait(batch[i + 1].url, false);
       }
 
-      // ── Send both HTMLs to the server in one request ────────────────────────
+      // ── Phase 2: full check ───────────────────────────────────────────────────
+      broadcast({ step: 'checking', message: `Full check — lead ${globalPos} of ${leads.length}`, current: globalPos, total: leads.length });
       const checkRes = await fetch(`${MOCK_SERVER}/check-lead`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profileHtml, companyHtml, activityHtml, workflow, url }),
+        body: JSON.stringify({ profileHtml, companyHtml, activityHtml, workflow, url, csvRow, csvHeaders }),
       });
-      const { pass } = await checkRes.json();
+      await checkRes.json();
 
-      if (!pass) {
-        await ensureContentScript(heyreachTabId);
-        if (!heyreachScrolled) {
-          await sendToContentScript(heyreachTabId, { action: 'scrollToLoadAll' });
-          heyreachScrolled = true;
-        }
-
-        const result = await sendToContentScript(heyreachTabId, { action: 'removeLead', linkedInUrl: url });
-        if (result && !result.ok) {
-          logger.warn('background', `removeLead failed for ${url}: ${result.error}`);
-          broadcast({ step: 'error', message: `Remove failed: ${result.error}` });
-        }
+      // Inter-profile pause within the batch
+      if (i + 1 < batch.length && !state.stopped) {
+        const interDelay = 10000 + Math.random() * 10000;
+        logger.debug('background', `Inter-profile delay: ${Math.round(interDelay / 1000)}s`);
+        await sleep(interDelay);
       }
-    }
+    } // end inner lead loop
 
-    // Close any pre-opened tab that was never consumed (workflow stopped early)
+    // Close any pre-opened tab that wasn't consumed (stopped early or end of batch)
     if (nextTabPromise) {
       nextTabPromise.then(id => chrome.tabs.remove(id).catch(() => {})).catch(() => {});
       nextTabPromise = null;
     }
 
+    // Save progress after each batch
+    const nextStart = batchStart + batch.length;
+    await chrome.storage.local.set({ [progressKey]: { startIndex: nextStart } });
+    logger.info('background', `Batch ${batchNum} complete. Progress saved at index ${nextStart}.`);
+
+    // Cooldown between batches — random 5–10 min, pinging server to stay warm
+    if (nextStart < leads.length && !state.stopped) {
+      const breakMs = (5 * 60 * 1000) + Math.random() * (5 * 60 * 1000);
+      const breakMin = Math.round(breakMs / 60000);
+      logger.info('background', `Cooling down ${breakMin} min before next batch...`);
+
+      let remaining = breakMs;
+      while (remaining > 0 && !state.stopped) {
+        const chunk = Math.min(remaining, 20000);
+        const secLeft = Math.ceil(remaining / 1000);
+        broadcast({
+          step: 'paused',
+          message: `Cooling down — ${secLeft}s before next batch`,
+          current: nextStart,
+          total: leads.length,
+        });
+        await sleep(chunk);
+        remaining -= chunk;
+        await fetch(`${MOCK_SERVER}/ping`).catch(() => {});
+      }
+    }
+
+    } // end outer batch loop
+
+    // All batches done — clear saved progress and download results
+    await chrome.storage.local.remove(progressKey);
     state.running = false;
     await sendToContentScript(heyreachTabId, { action: 'hideStopButton' });
 
+    await downloadCsvIfNotEmpty('/priority-leads.csv', 'priority-leads.csv');
     await downloadCsvIfNotEmpty('/no-activity-leads.csv', 'no-activity-leads.csv');
     await downloadCsvIfNotEmpty('/investigation-leads.csv', 'investigation-leads.csv');
 
-    broadcast({ step: 'done', message: `Done. Processed ${urls.length} leads.`, current: urls.length, total: urls.length });
+    const processed = Math.min(leads.length, /* startIndex already used */ leads.length);
+    broadcast({ step: 'done', message: `Done. Processed all ${leads.length} leads.`, current: leads.length, total: leads.length });
 
   } catch (err) {
     state.running = false;
+    clearInterval(keepAlive);
     await sendToContentScript(heyreachTabId, { action: 'hideStopButton' });
     broadcast({ step: 'error', message: `Error: ${err.message}` });
+    return;
   }
+  clearInterval(keepAlive);
 }
 
 async function testProfile(url, criteria) {
@@ -361,7 +457,7 @@ async function testProfile(url, criteria) {
           },
           args: [scrollY],
         });
-        await sleep(1000);
+        await sleep(2000);
 
         const [{ result: domState }] = await chrome.scripting.executeScript({
           target: { tabId: linkedInTabId },
@@ -395,7 +491,7 @@ async function testProfile(url, criteria) {
         if (!activityTriggered && domState.activityBottomVisible) {
           activityTriggered = true;
           domEvent('activity_visible_waiting');
-          await sleep(1000);
+          await sleep(2000);
           const [{ result: text }] = await chrome.scripting.executeScript({
             target: { tabId: linkedInTabId },
             func: () => {
@@ -642,13 +738,15 @@ async function fetchHeyreachCsv(heyreachTabId) {
         'authorization': `Bearer ${token}`,
         'x-requested-with': 'XMLHttpRequest',
         'accept': 'application/json, text/plain, */*',
+        'cache-control': 'no-cache',
+        'pragma': 'no-cache',
       };
       if (orgUnits) headers['x-organization-units'] = String(orgUnits);
 
       try {
         const resp = await fetch(
-          `https://api.heyreach.io/api/LinkedInUserList/GetExportedUsersFromList?listId=${listId}`,
-          { headers }
+          `https://api.heyreach.io/api/LinkedInUserList/GetExportedUsersFromList?listId=${listId}&_=${Date.now()}`,
+          { headers, cache: 'no-store' }
         );
         if (!resp.ok) return { error: `Export API returned ${resp.status}` };
         const csvText = await resp.text();
@@ -680,14 +778,18 @@ function parseCsvLine(line) {
   return out;
 }
 
-function parseLinkedInUrls(csvText) {
+function parseLeads(csvText) {
   const lines = csvText.split('\n').filter(l => l.trim());
-  if (lines.length < 2) return [];
-  const headers = parseCsvLine(lines[0]);
-  const urlIdx = headers.findIndex(h => h.trim() === 'Profile URL');
-  if (urlIdx === -1) return [];
-  return lines.slice(1)
-    .map(line => parseCsvLine(line)[urlIdx]?.trim())
-    .filter(u => u && u.startsWith('https://www.linkedin.com/in/'))
-    .map(u => u.replace(/\/$/, ''));
+  if (lines.length < 2) return { headers: '', leads: [] };
+  const headers = lines[0];
+  const urlIdx = parseCsvLine(headers).findIndex(h => h.trim() === 'Profile URL');
+  if (urlIdx === -1) return { headers, leads: [] };
+  const leads = [];
+  for (const row of lines.slice(1)) {
+    const url = parseCsvLine(row)[urlIdx]?.trim();
+    if (url && url.startsWith('https://www.linkedin.com/in/')) {
+      leads.push({ url: url.replace(/\/$/, ''), row });
+    }
+  }
+  return { headers, leads };
 }

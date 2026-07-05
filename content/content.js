@@ -176,7 +176,7 @@ function waitForElement(selector, timeout) {
 }
 
 function waitForRemoval(el, timeout) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     if (!document.contains(el)) { resolve(); return; }
 
     const obs = new MutationObserver(() => {
@@ -184,7 +184,11 @@ function waitForRemoval(el, timeout) {
     });
 
     obs.observe(document.body, { childList: true, subtree: true });
-    setTimeout(() => { obs.disconnect(); resolve(); }, timeout);
+    setTimeout(() => {
+      obs.disconnect();
+      if (document.contains(el)) reject(new Error('Row was not removed from DOM within timeout'));
+      else resolve();
+    }, timeout);
   });
 }
 
